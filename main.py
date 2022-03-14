@@ -3,6 +3,7 @@ import torchvision
 import os
 import torch
 from sklearn.cluster import KMeans
+import shutil
 
 def get_file_paths(dir):
     'returns list of .jpg files in a directory'
@@ -53,7 +54,7 @@ def get_saliency(boxes, scores):
     for box, score in zip(boxes, scores):
         saliency += score * rect_area(*box)
     
-    return saliency.item()
+    return saliency
 
 def clusterize(vectors, n=2):
     'clusterizes a set of verctors and returns its labels'
@@ -64,6 +65,8 @@ def clusterize(vectors, n=2):
 def main():
 
     device = 'cuda'
+    dir = 'frames'
+    n_clusters = 6
 
     detection_model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
     detection_model.eval().to(device)
@@ -71,7 +74,6 @@ def main():
     resnet = torchvision.models.resnet50(pretrained=True)
     feature_extractor = torch.nn.Sequential(*(list(resnet.children())[:-1])).eval().to(device)
     
-    dir = 'frames'
     img_properties = {}  # dict structure: {file_path: {'saliency': value, 'feature_vector': vector}}
     
     # save info on saliency score and feature vector (clustering input)
@@ -87,7 +89,15 @@ def main():
     for v in img_properties.values():
         vectors.append(v['feature_vector'])
 
-    cluster_labels = clusterize(vectors)
+    cluster_labels = clusterize(vectors, n=n_clusters)
+    
+    # FOR TESTING ONLY:
+    # create scene-based folders
+    for label in set(cluster_labels):
+        os.mkdir(os.path.join('output', f'scene_{label}'), mode=0o666)
+    for label, file_path in zip(cluster_labels, img_properties.keys()):
+        _, filename = os.path.split(file_path)
+        shutil.copyfile(src=file_path, dst=os.path.join('output', f'scene_{label}', filename))
     
     # for each cluster find an image (filename) with the highest saliency
     max_saliencies = {}  # dict format: {cluster_label: {file_path: path, saliency: val}, ...}
@@ -98,9 +108,12 @@ def main():
                 if img_properties[file_path]['saliency'] > max_saliencies[cluster]['saliency']:
                     max_saliencies[cluster]['file_path'] = file_path
                     max_saliencies[cluster]['saliency'] = img_properties[file_path]['saliency']
-    
-    print(max_saliencies)
-    pass
+
+    # FOR TESTING ONLY:
+    # copy best image to relevant scene-based folder
+    for label in set(cluster_labels):
+        best_file_path = max_saliencies[label]['file_path']
+        shutil.copyfile(src=best_file_path, dst=os.path.join('output', f'scene_{label}', f'00{label}.jpg'))
 
 if __name__ == '__main__':
     main()
