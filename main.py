@@ -1,3 +1,4 @@
+from turtle import distance
 import cv2
 import torchvision
 import os
@@ -5,7 +6,8 @@ import torch
 from sklearn.cluster import KMeans
 import shutil
 
-def get_file_paths(dir):
+
+def get_jpeg_paths(dir):
     'returns list of .jpg files in a directory'
     filenames = os.listdir(dir)
     file_paths = [os.path.join(dir, filename) for filename in filenames\
@@ -14,106 +16,121 @@ def get_file_paths(dir):
     return file_paths
 
 
-def rect_area(x1, y1, x2, y2):
-    'returns an area of a rectnagle by its coordinates'
-    return abs(x1-x2) * abs(y1-y2)
-
-def prepare_for_model(img, device):
-    '''
-    converts an array to torch tensor
-    moves it to the given device
-    manages its dimensions to suit the (B, C, H, W) format
-    and converts 0-255 uint8 to 0-1 float32
+def get_feature_vector(path, model, device, transforms):
+    '''reads and prepares the image for the model,
+    performs forward pass of an feature extractor
+    to get the feature vector
     '''
     
-    img = cv2.resize(img, (img.shape[0]//4, img.shape[1]//4))
-    img = torch.tensor(img).to(device).movedim(-1, 0).unsqueeze(dim=0) / 255
+    # prepare the image for the model
+    img = torchvision.io.read_image(path).to(device).unsqueeze(0)  # img is 0-255
+    img = img / 255  # 0-255 uint8 to 0-1 float32
+    img = transforms(img)
     
-    return img
-
-def get_features(img, device, detection_model, feature_extractor):
-    '''passes given image through
-    object detection and classification models
-    to extract some features for clustering and
-    saliency estimation
-    '''
-    img = prepare_for_model(img, device)
+    # perform forward pass
     with torch.no_grad():
-        output = detection_model(img)[0]
-        feature_vector = feature_extractor(img).flatten()
-    boxes = output['boxes']
-    scores = output['scores']
-        
-    return boxes, scores, feature_vector
+        feature_vector = model(img)[0]
+
+    return feature_vector
 
 
-def get_saliency(boxes, scores):
-    'returns a custom saliency criterion'
-    
-    saliency = 0
-    for box, score in zip(boxes, scores):
-        saliency += score * rect_area(*box)
-    
-    return saliency
-
-def clusterize(vectors, n=2):
-    'clusterizes a set of verctors and returns its labels'
-    kmeans = KMeans(n_clusters=n, random_state=0).fit(vectors)
+def cluster(vectors, n_clusters):
+    '''clusters a set of verctors and returns its labels'''
+    kmeans = KMeans(n_clusters, random_state=0).fit(vectors)
     return kmeans.labels_
 
 
-def main():
+def euclidean_distance(tensor1, tensor2):
+    '''calculates eucledean distance
+    between two n-dimensinal points'''
+    return (tensor1 - tensor2).pow(2).sum().sqrt()
 
-    device = 'cuda'
-    dir = 'frames'
-    n_clusters = 6
 
-    detection_model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
-    detection_model.eval().to(device)
+def find_closest(sequence, point):
+    '''Finds an index of an element of the given sequence
+    which is the closest to the given point
+    Assumes that a sequence element and the point
+    have equal dimensions (i.e., they are in the same space).
+    NOTE: a sequence element is a point itself
+    '''
+    
+    # form a list (--> tensor) of distances between
+    # elements of a tensor and the given point
+    distances = torch.tensor([euclidean_distance(element, point) for element in sequence])
+    return torch.argmin(distances)
 
-    resnet = torchvision.models.resnet50(pretrained=True)
-    feature_extractor = torch.nn.Sequential(*(list(resnet.children())[:-1])).eval().to(device)
-    
-    img_properties = {}  # dict structure: {file_path: {'saliency': value, 'feature_vector': vector}}
-    
-    # save info on saliency score and feature vector (clustering input)
-    # for each image in a directory into a img_properties dictionary
-    for file_path in get_file_paths(dir):
-        img = cv2.imread(file_path)
-        scores, boxes, feature_vector = get_features(img, device, detection_model, feature_extractor)
-        img_properties[file_path] = {'saliency': get_saliency(scores, boxes),
-                                    'feature_vector': feature_vector.cpu().numpy()}
-    
-    # form a list of feature vectors to feed it into a clusterizator
-    vectors = []
-    for v in img_properties.values():
-        vectors.append(v['feature_vector'])
 
-    cluster_labels = clusterize(vectors, n=n_clusters)
-    
-    # FOR TESTING ONLY:
-    # create scene-based folders
-    for label in set(cluster_labels):
-        os.mkdir(os.path.join('output', f'scene_{label}'), mode=0o666)
-    for label, file_path in zip(cluster_labels, img_properties.keys()):
+def make_cluster_subfolders(output_dir, file_paths, labels):
+    '''Creates a subfolder for each cluster,
+    and copies files into corresponding subfolder,
+    based on their cluster labels.
+    NOTE: only for the visualization, not the inference
+    '''
+    for label in set(labels):
+        os.mkdir(os.path.join(output_dir, f'scene_{label}'))
+        
+    for label, file_path in zip(labels, file_paths):
         _, filename = os.path.split(file_path)
         shutil.copyfile(src=file_path, dst=os.path.join('output', f'scene_{label}', filename))
+        
+
+def main():
+
+    # parameters
+    device = 'cuda'
+    dir = 'frames2'
+    output_dir = 'output'
+    n_clusters = 4
+    img_size = (1920, 1440)  # H, W
+    downscale_factor = 4
+    subfolders = True  # to make or not to make cluster subfolders
+
+    # create the resnet model (feature extractor) instance
+    model = torchvision.models.resnet50(pretrained=True)
+    model = torch.nn.Sequential(*(list(model.children())[:-1])).eval().to(device)
     
-    # for each cluster find an image (filename) with the highest saliency
-    max_saliencies = {}  # dict format: {cluster_label: {file_path: path, saliency: val}, ...}
-    for cluster in set(cluster_labels):
-        max_saliencies[cluster] = {'saliency': 0}
-        for label, file_path in zip(cluster_labels, img_properties.keys()):
+    # define transforms for image preprocessing
+    new_size = (img_size[0] // downscale_factor, img_size[1] // downscale_factor)
+    transforms = torch.nn.Sequential(torchvision.transforms.Resize(new_size))
+    
+    # form a list of feature vectors
+    feature_vectors = []
+    file_paths = get_jpeg_paths(dir)
+    for path in file_paths:
+        feature_vectors.append(get_feature_vector(path, model, device, transforms))
+    feature_vectors = torch.stack(feature_vectors).squeeze()
+    
+    # cluster feature vectors (images),
+    # get their labels, and centers of clusters
+    kmeans = KMeans(n_clusters, random_state=0).fit(feature_vectors.cpu().numpy())
+    labels = kmeans.labels_  # ordered wrt file_paths
+    centers = kmeans.cluster_centers_
+    
+    # make cluster subfolders if needed
+    if subfolders:
+        make_cluster_subfolders(output_dir, file_paths, labels)
+    
+    # find a feature vector (an image),
+    # which is the closest to each cluster center.
+    # These closest images are keyframes
+    # TODO: restructure with a find_closest function variation
+    keyframes_paths = []
+    for cluster, center in zip(set(labels), centers):
+        center = torch.tensor(center).to(device)
+        min_distance = -1  # placeholder
+        for file_path, label, feature_vector in zip(file_paths, labels, feature_vectors):
             if label == cluster:
-                if img_properties[file_path]['saliency'] > max_saliencies[cluster]['saliency']:
-                    max_saliencies[cluster]['file_path'] = file_path
-                    max_saliencies[cluster]['saliency'] = img_properties[file_path]['saliency']
-
-    # FOR TESTING ONLY:
-    # copy best image to relevant scene-based folder
-    for label in set(cluster_labels):
-        best_file_path = max_saliencies[label]['file_path']
-        shutil.copyfile(src=best_file_path, dst=os.path.join('output', f'scene_{label}', f'00{label}.jpg'))
-
+                distance = euclidean_distance(feature_vector, center)
+                if distance < min_distance or min_distance == -1:
+                    min_distance = distance
+                    keyframe = file_path
+        keyframes_paths.append(keyframe)
+    
+    # create a subfolder and fill it with keyframes
+    os.mkdir(os.path.join(output_dir, 'keyframes'))
+    for idx, keyframe_path in enumerate(keyframes_paths):
+        shutil.copyfile(src=keyframe_path, dst=os.path.join('output', 'keyframes', f'{idx}.jpg'))
+        
+        
 if __name__ == '__main__':
     main()
